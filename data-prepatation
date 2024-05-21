@@ -1,0 +1,250 @@
+import os
+from dotenv import load_dotenv
+from langchain_community.document_loaders.pdf import PDFPlumberLoader
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_core.documents import Document
+from langchain_core.exceptions import OutputParserException
+from langchain_community.document_loaders import YoutubeLoader
+from langchain_openai import OpenAIEmbeddings, ChatOpenAI
+from langchain_community.document_transformers.openai_functions import (create_metadata_tagger,)
+from langchain_community.vectorstores import DeepLake
+
+
+
+
+#################################################################################################################################
+#ENVIRONMENT VARIABLES & SKIP UPLOADING DATA IF ALREADY IN VECTOR STORE
+#################################################################################################################################
+
+load_dotenv()
+OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
+
+os.environ['ACTIVELOOP_TOKEN'] = os.getenv("ACTIVELOOP_TOKEN")
+
+
+#################################################################################################################################
+#LOADING PDF FILES AND SPLITTING TEXT
+#################################################################################################################################
+skip_loading = input("Do you want to skip loading the Textbook? (y/n) ")
+
+if skip_loading.lower() == 'y':
+    print("Skipping data loading...")
+    
+else:
+    #We are loading the Textbook from the directory here
+    #Loading the Textbook from other sources (Onedrive etc.) is possible too: https://python.langchain.com/docs/integrations/document_loaders/
+    print("Loading data...")  
+    #We use PDFPlumber because it returns detailed metadata, most importantly it retains the page number
+    loader = PDFPlumberLoader(r"C:\path to file\")
+    document = loader.load()
+    print(f"Type of document: {type(document)}")
+    if isinstance(document, list):
+        print(f"Length of document: {len(document)}")
+            
+    #Here we can define the pages it passes on - because of the size of the book, processing all the pages is not ideal
+    pages = document [300:672]
+
+    #The textsplitter splits up each page into chunks of 1000 characters - smaller chunks increase the processing time but also give more precise search results
+    text_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=1000,
+        chunk_overlap=100,
+        length_function=len,
+        is_separator_regex=False,
+    )
+    texts = text_splitter.split_documents(pages)
+    
+    if texts is not None and len(texts) > 0:
+        print(f"Data is split into {len(texts)} documents.")
+    else:
+        print("No data split.")
+
+
+    #Here we remove the unneccessary metadata and add some of our own
+    keys_to_remove = ["source", "file_path", "Creator", "Producer", "ModDate", "CreationDate", "Title", "Keywords"]
+    pearson_count = 0
+    #We take the author page and book title and create a single metadata tag out of it - makes it easier for the llm down the line to give a source in the format we want
+    for document in texts:
+        subject = document.metadata.get("Subject", "")
+        author = document.metadata.get("Author", "")
+        page = document.metadata.get("page", "")
+        page_str = str(page)
+        if page_str:
+            page_str = "p. " + page_str
+        source_parts = filter(None, [subject, author, page_str])
+        source_value = ", ".join(source_parts)
+        document.metadata["Source"] = source_value
+
+        #Here we remove the metadata we dont need (defined above), saves tokens in the answer and the llm cant get confused by it
+        document.metadata = {k: v for k, v in document.metadata.items() if k not in keys_to_remove}
+
+        #we rename the metadata-tag "Subject" to Book-Title
+        if "Subject" in document.metadata:
+            document.metadata["Book-Title"] = document.metadata.pop("Subject")
+
+        #For some reason this ultra long string appears on every page - we dont need it and therefore we remove it from our data
+        pearson_count += document.page_content.count("PPeeaarrssoonn//44222211 TThhoonneemmaannnn// —— OOppeerraattiioonnss MMaannaaggeemmeenntt AAuugguusstt 1111,, 22001155 1111::1133 CCEETT")
+        document.page_content = document.page_content.replace("PPeeaarrssoonn//44222211 TThhoonneemmaannnn// —— OOppeerraattiioonnss MMaannaaggeemmeenntt AAuugguusstt 1111,, 22001155 1111::1133 CCEETT", "")
+
+    #This is just a counter to check if that string is removed
+    print("Number of Pearsons removed:", pearson_count)
+    
+
+    
+#################################################################################################################################
+#EXTRACTING PROPERTIES AND APPEND THE PROPERTIES AS METADATA
+#################################################################################################################################
+    #Defining the llm - for the openai metadata extractor we need to use ChatOpenAI
+    llm = ChatOpenAI(temperature=0, model="gpt-3.5-turbo-0613")
+
+    # Next, we want to analyse each chunk and extract certain values from the page_content and append it to the metadata. Serves the purpose for better filtering and categorizing the data
+    # Define the properties to extract, we use a Json schema
+    schema = {
+        "properties": {
+            "key_concepts": {
+                "type": "string", 
+                "description": "translate to english the Key concepts or terms that are important."},
+            "formulas": {
+                "type": "string",
+                "description": "translate to english the name of mathematical formulas or what they calculate"},
+            "tables": {
+                "type": "string",
+                "description": "Description of tables and illustrations found in the text."},
+            "headers": {
+                "type": "string",
+                "description": "Chapter or section headers found in the text."},  
+            },
+        "required": ["key_concepts"],
+
+        }
+        
+    #The Document transformer uses the schema above and extracts the metadata
+    document_transformer = create_metadata_tagger(metadata_schema=schema, llm=llm)
+
+    extracted_docs = []
+    #We send each chunk seperately, since sending hundreds of chunks at once usually results in an error. This way an error affects only a single chunk and the code continues
+    for i in range(0, len(texts), 1):
+        batch = texts[i:i+1]
+        try:
+            extracted_docs.extend(document_transformer.transform_documents(batch))
+        except OutputParserException:
+            print(f"An error occurred while processing documents {i} to {i+1}. Skipping...")
+            continue
+        print(f"Extracted metadata for documents {i} to {i+1}")
+    print("extracting done")
+    
+    
+
+#################################################################################################################################
+#EMBEDDINGS VECTOR STORE
+#################################################################################################################################
+    #We use DeepLake as a Vectorstore since it supports SelfQueryretrieval
+    model_name = 'text-embedding-ada-002'  
+
+    embeddings = OpenAIEmbeddings()
+
+    dataset_path = "hub://cyriljacober/text_embedding"
+    
+    #overwrite = false adds the data to existing vectors - set to True if you want to clear the vectorstore before uploading new data
+    vectorstore = DeepLake.from_documents(extracted_docs, dataset_path=dataset_path, embedding=embeddings, overwrite = False )
+    
+    print("Index is ready")
+
+    
+    
+    
+    
+
+#################################################################################################################################
+#Loading Youtube Transcripts (the video urls are stored in youtube.py)
+#################################################################################################################################
+from youtube import youtube_urls
+
+skip_loading = input("Do you want to skip loading Videos? (y/n) ")
+
+if skip_loading.lower() == 'y':
+    print("Skipping data loading...")
+    
+else:
+    print("Loading data...")
+    text_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=1000,
+        chunk_overlap=100,
+        length_function=len,
+        is_separator_regex=False,
+    )
+    
+    transcripts = []
+    for url in youtube_urls:
+        loaderyt = YoutubeLoader.from_youtube_url(
+            url, add_video_info=True, continue_on_failure=True)
+        
+        transcript = loaderyt.load()
+        transcripts.extend(transcript)
+    
+    split_transcripts = text_splitter.split_documents(transcripts)
+    
+    if transcripts is not None and len(transcripts) > 0:
+        print(f"Data is split into {len(split_transcripts)} documents.")
+    else:
+        print("No data split.")
+    
+    keys_to_remove = ["source", "description", "view_count", "thumbnail_url", "publish_date", "length"]
+    
+    for document in split_transcripts:
+        document.metadata = {k: v for k, v in document.metadata.items() if k not in keys_to_remove}
+        if "title" in document.metadata:
+            document.metadata["Source"] = document.metadata.pop("title")
+        
+
+
+#################################################################################################################################
+#EXTRACTING PROPERTIES AND APPEND THE PROPERTIES AS METADATA
+#################################################################################################################################
+    llm = ChatOpenAI(temperature=0, model="gpt-3.5-turbo-0613")
+
+    
+    # Define the properties to extract
+    schema = {
+        "properties": {
+            "key_concepts": {
+                "type": "string", 
+                "description": "the Key concepts or terms that are important."},  
+            },
+        "required": ["key_concepts"],
+
+        }
+        
+
+    document_transformer = create_metadata_tagger(metadata_schema=schema, llm=llm)
+
+    extracted_transcripts = []
+
+    for i in range(0, len(split_transcripts), 1):
+        batch = split_transcripts[i:i+1]
+        try:
+            extracted_transcripts.extend(document_transformer.transform_documents(batch))
+        except OutputParserException:
+            print(f"An error occurred while processing documents {i} to {i+1}. Skipping...")
+            continue
+        print(f"Extracted metadata for documents {i} to {i+1}")
+    print("extracting done")
+    
+    print(extracted_transcripts[1])
+
+    
+#################################################################################################################################
+#EMBEDDINGS VECTOR STORE
+#################################################################################################################################
+    
+    model_name = 'text-embedding-ada-002'  
+
+    embeddings = OpenAIEmbeddings()
+
+    dataset_path = "insert-link-here"
+    
+    vectorstore = DeepLake.from_documents(extracted_transcripts, dataset_path=dataset_path, embedding=embeddings, overwrite = False )
+    
+    print("Index is ready")
+
+    
+
