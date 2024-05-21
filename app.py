@@ -41,7 +41,7 @@ embeddings = OpenAIEmbeddings(
 
 
 #defining the vectorstore
-dataset_path = "hub://cyriljacober/text_embedding"
+dataset_path = "link to dataset"
 vectorstore = DeepLake(dataset_path=dataset_path, read_only=True, embedding=embeddings) 
 
 #We set up the self-query retriever, that means that the retrievers filters the vectors by metadata based on the question
